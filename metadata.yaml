@@ -1,0 +1,37 @@
+name: astrbot_plugin_arc_guard
+display_name: 弧光护卫
+desc: 可配置违禁词检测与累加禁言；图片 OCR；联动机器人违禁时连坐其 @ 的人；支持求饶减刑
+short_desc: 弧光护卫违禁词禁言
+help: |
+  自动检测群成员发言、群名片、图片 OCR 文字、@ 对象群名片与 AI 回复中的违禁关键词
+  （忽略大小写与分隔符；希腊文/西里尔文等形似字同样计入）。
+  关键词可在配置 forbidden_keywords 中逐项添加；单项内空格表示「同时出现」组合
+  （如 sb enmo），默认 sb enmo。
+  AI 回复命中时拦截原文、改为警告，并禁言对话对象（白名单仍不禁言，但原文照样拦截）。
+  经弧光消息中枢的 Minecraft AI（弧光天星）回复同样检测。
+
+  出现几次就禁言几分钟。白名单 QQ（默认 593405016）发言不处理。
+  所有禁言均为累加（剩余时间 + 新增时间），不会用短禁言顶掉长禁言。
+  禁言接口不可用时降级为限时屏蔽：日常聊天不回复，但仍检测关键词并累加处罚。
+  跨插件 mute_user / mute_user_in_group（支持 respect_whitelist）/ unmute_user / unmute_user_in_group。
+  LLM 工具 arc_mute_user：大模型可对指定用户 ID 追加禁言（同样累加）。
+  LLM 工具 arc_unmute_user：大模型可解除指定用户在本群的禁言与限时屏蔽。
+  真禁言仅支持 aiocqhttp（OneBot set_group_ban）；其它平台无原生禁言时降级为限时屏蔽。
+  图片 OCR：本地 RapidOCR（ocr_enabled 可开关）；透明图白底+黑底双扫防幻影坦克；超大图先缩到最长边 1920；黑底补方与四向旋转再扫。
+  @ 检测：把被 @ 者的群名片替换/补进检测文本，防止「名片写违禁词 + 被人 @」绕过。
+  机器人群名片守护：每秒检测；被改则强制改回 bot_group_card，并制裁操作者/配置名单。
+
+  私聊求饶：配置 pardon_enabled 可开关；开启后私聊发送求饶台词可减刑。
+  群内求饶：pardon_in_group 默认开启；群里发送同一台词可减免本群禁言/屏蔽
+  （适合不支持私聊、禁言降级为屏蔽的平台）。
+
+  连坐：QQ 2267236706 等联动机器人若发出违禁内容，
+  则禁言其消息里 @ 的人（次数 × 2 分钟，例如 10 次 → 20 分钟）。
+version: 1.9.24
+author: DEVILENMO
+repo: https://github.com/DEVILENMO/astrbot_plugin_arc_guard
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook
+astrbot_version: ">=4.0.0"

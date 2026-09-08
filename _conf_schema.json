@@ -1,0 +1,173 @@
+{
+  "forbidden_keywords": {
+    "description": "禁言关键词列表",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "hint": "可逐项添加。忽略大小写与形似字，只保留英文字母参与匹配。单项内空格/+表示「同时出现」组合（如 sb enmo）；整词连写仍为连续匹配（如 enmosb）。逗号分隔多条规则。默认 sb enmo",
+    "default": ["sb enmo"]
+  },
+  "mute_seconds_per_hit": {
+    "description": "每次命中禁言秒数",
+    "type": "int",
+    "hint": "命中一次关键词禁言多少秒；发了 N 次则禁言 N×该值（默认 60=一分钟/次），上限约 30 天",
+    "default": 60
+  },
+  "reply_text": {
+    "description": "命中后的回复文案",
+    "type": "string",
+    "hint": "可用占位符 {minutes}（禁言分钟数）。默认：竟敢辱骂至高无上的ENMO，枪毙{minutes}分钟！",
+    "default": "竟敢辱骂至高无上的ENMO，枪毙{minutes}分钟！"
+  },
+  "nickname_reply_text": {
+    "description": "群名片命中后的回复文案",
+    "type": "string",
+    "hint": "群昵称/群名片含关键词时使用。可用 {minutes}。默认：群名片写辱骂ENMO？枪毙{minutes}分钟，改干净再说话！",
+    "default": "群名片写辱骂ENMO？枪毙{minutes}分钟，改干净再说话！"
+  },
+  "linked_bot_ids": {
+    "description": "连坐联动机器人 ID",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "hint": "这些号发出违禁序列时，不禁言机器人本身，改为禁言其消息里 @ 的人。可填 QQ 号或官方 openid。默认 2267236706",
+    "default": ["2267236706"]
+  },
+  "accomplice_mute_seconds": {
+    "description": "连坐每次命中禁言秒数",
+    "type": "int",
+    "hint": "教唆犯按命中次数累计：N 次 × 该值。默认 120（两分钟/次），即机器人说了 10 个则连坐 20 分钟",
+    "default": 120
+  },
+  "accomplice_reply": {
+    "description": "连坐回复文案",
+    "type": "string",
+    "hint": "惩罚教唆犯时发送的文本",
+    "default": "人家本来就傻，你还他妈逗人家，连坐惩罚！"
+  },
+  "exempt_admins": {
+    "description": "豁免 AstrBot 管理员",
+    "type": "bool",
+    "hint": "为 true 时不对 AstrBot 配置中的管理员执行禁言（仍会检测并回复）",
+    "default": true
+  },
+  "whitelist_ids": {
+    "description": "禁言白名单 ID",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "hint": "这些号：群消息跳过违禁检测；默认不会被累加禁言（LLM/改名片等）。调用 mute_user 时可传 respect_whitelist=false 强制禁言（自爆卡车如此）。可填 QQ 号或官方 openid。默认 593405016",
+    "default": ["593405016"]
+  },
+  "blacklist_ids": {
+    "description": "黑名单 ID",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "hint": "这些号的群消息一律拦截（机器人/AI 不处理日常对话）。含违禁词时：普通人直接禁言；联动机器人则连坐其 @ 的拱火者。可填 QQ 号或官方 openid。默认空",
+    "default": []
+  },
+  "shield_fallback": {
+    "description": "禁言失败时降级为限时屏蔽",
+    "type": "bool",
+    "hint": "开启后，群禁言接口不可用或调用失败时，按相同累加时长屏蔽该用户：日常聊天不回复，但仍检测关键词并加强处罚。求饶同样可减少屏蔽时间。",
+    "default": true
+  },
+  "ocr_enabled": {
+    "description": "开启图片 OCR 违禁检测",
+    "type": "bool",
+    "hint": "开启后对群消息中的图片做本地 RapidOCR，识别出的文字同样走违禁词检测。带透明通道的图会白底+黑底各扫一次（防幻影坦克）。需安装 rapidocr 与 onnxruntime",
+    "default": true
+  },
+  "pardon_enabled": {
+    "description": "开启求饶减刑",
+    "type": "bool",
+    "hint": "关闭后私聊与群内求饶均无效。开启后，被禁言/屏蔽的用户发送求饶台词可减少禁言与屏蔽时间",
+    "default": true
+  },
+  "pardon_in_group": {
+    "description": "开启群内求饶",
+    "type": "bool",
+    "hint": "开启后在群里发送求饶台词也可减刑（适合不支持私聊或禁言降级为屏蔽的平台）。只减免当前群的禁言/屏蔽。默认开启",
+    "default": true
+  },
+  "pardon_phrase": {
+    "description": "求饶台词",
+    "type": "string",
+    "hint": "私聊或群消息需包含该台词（忽略空白）。默认：天星大人我错了，我跪下求你放过我",
+    "default": "天星大人我错了，我跪下求你放过我"
+  },
+  "pardon_reduce_seconds": {
+    "description": "每次求饶减刑秒数",
+    "type": "int",
+    "hint": "默认 3600（1 小时）",
+    "default": 3600
+  },
+  "pardon_cooldown_seconds": {
+    "description": "求饶冷却秒数",
+    "type": "int",
+    "hint": "两次成功求饶之间的最短间隔，防止刷减刑。默认 10 秒",
+    "default": 10
+  },
+  "pardon_ok_reply": {
+    "description": "求饶成功回复",
+    "type": "string",
+    "hint": "可用 {minutes}（减刑后剩余约多少分钟）。禁言/屏蔽已清零时用固定文案。",
+    "default": "念在你跪得诚恳，减刑 1 小时。还剩约 {minutes} 分钟，下次说话注意点。"
+  },
+  "pardon_none_reply": {
+    "description": "未在处罚时的回复",
+    "type": "string",
+    "hint": "求饶但当前没有禁言/屏蔽剩余时回复",
+    "default": "你现在又没被禁言或屏蔽，跪给谁看？"
+  },
+  "pardon_cooldown_reply": {
+    "description": "求饶冷却中的回复",
+    "type": "string",
+    "hint": "可用 {seconds}（剩余冷却秒数）、{minutes}",
+    "default": "求饶冷却中，约 {seconds} 秒后再来跪。"
+  },
+  "pardon_broadcast": {
+    "description": "私聊求饶成功群广播文案",
+    "type": "string",
+    "hint": "私聊求饶成功后，会在减刑涉及的群里 @ 当事人并发送。群内求饶只在本群直接回复，不走此广播。可用 {minutes}、{qq}、{hours}",
+    "default": "私聊跪下求饶了。鉴于认罪态度良好，特赦减刑 1 小时；也可申请打屁股作为替代惩罚，跪得再标准点说不定还能再减。（减刑后约剩 {minutes} 分钟）"
+  },
+  "card_tamper_protect": {
+    "description": "保护机器人群名片",
+    "type": "bool",
+    "hint": "开启后每秒检测本机人群名片；被改则强制改回 bot_group_card，并制裁操作者（若协议提供）或 card_tamper_punish_ids",
+    "default": true
+  },
+  "bot_group_card": {
+    "description": "机器人群名片",
+    "type": "string",
+    "hint": "被改后要强制改回的名片。默认：天星大人",
+    "default": "天星大人"
+  },
+  "card_tamper_punish_ids": {
+    "description": "改名片回退制裁 ID",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "hint": "协议没给出操作者时，才禁言这些账号。若通知带 operator_id，则只禁言操作者本人。可填 QQ 号或官方 openid。默认 1034297259",
+    "default": ["1034297259"]
+  },
+  "card_tamper_mute_seconds": {
+    "description": "改名片禁言秒数",
+    "type": "int",
+    "hint": "每次改名片制裁追加的禁言秒数（累加）。默认 3600（1 小时）",
+    "default": 3600
+  },
+  "card_tamper_reply": {
+    "description": "改名片制裁回复",
+    "type": "string",
+    "hint": "改回名片并制裁后在群内发送的文案",
+    "default": "我他妈让你改我群名片了吗？阿弥诺斯。"
+  }
+}
