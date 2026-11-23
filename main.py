@@ -5,7 +5,11 @@ import json
 import re
 import time
 import unicodedata
+from collections import deque
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from botpy.http import Route
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -13,7 +17,7 @@ from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.provider import LLMResponse
 from astrbot.api.star import Context, Star, StarTools, register
 
-PLUGIN_VERSION = "1.9.24"
+PLUGIN_VERSION = "1.12.0"
 PLUGIN_NAME = "astrbot_plugin_arc_guard"
 GUARD_DISPLAY = "弧光护卫"
 
@@ -23,6 +27,9 @@ DEFAULT_FORBIDDEN_KEYWORDS = ("sb enmo",)
 
 # QQ group ban upper bound (~30 days).
 MAX_MUTE_SECONDS = 30 * 24 * 60 * 60
+
+# Shared denial text for LLM tools that only super admins may use.
+SUPER_ADMIN_DENIED = "权限不足：该功能仅超级管理员可用"
 
 DEFAULT_REPLY_TEMPLATE = "竟敢辱骂至高无上的ENMO，枪毙{minutes}分钟！"
 DEFAULT_NICKNAME_REPLY = "群名片写辱骂ENMO？枪毙{minutes}分钟，改干净再说话！"
@@ -51,6 +58,14 @@ CARD_GROUP_LIST_REFRESH_SECONDS = 60.0
 CARD_ACTION_COOLDOWN_SECONDS = 2.0
 OCR_MAX_SIDE = 1920
 OCR_MIN_LONG_SIDE = 640
+# Timeout for official (botpy) group admin API calls (mute query / set / recall).
+_OFFICIAL_API_TIMEOUT = 5
+DEFAULT_RECALL_ON_HIT = True
+# Newest messages kept per group so super admins can recall them by sender.
+RECENT_MSGS_PER_GROUP = 200
+RECALL_MAX_COUNT = 5
+# qq_official refuses to recall messages sent earlier than this.
+OFFICIAL_RECALL_WINDOW_SECONDS = 120
 
 
 class ArcGuardAPI:
@@ -86,15 +101,15 @@ class ArcGuardAPI:
         return self._plugin._is_whitelisted(str(user_id or ""))
 
     def is_blacklisted(self, user_id: str) -> bool:
-        """Whether a QQ id is on the Arc Guard intercept blacklist.
+        """Whether a user id is permanently shielded (the blacklist).
 
         Args:
-            user_id: QQ user id.
+            user_id: QQ user id or official member openid.
 
         Returns:
-            True if the user's group messages must be intercepted.
+            True if the user's chat must be intercepted everywhere.
         """
-        return self._plugin._is_blacklisted(str(user_id or ""))
+        return self._plugin._is_permanently_shielded(str(user_id or ""))
 
     async def mute_user(
         self,
@@ -168,17 +183,19 @@ class ArcGuardAPI:
         event: AstrMessageEvent,
         user_id: str,
     ) -> dict:
-        """Clear mute and timed shield for one member in the current group.
+        """Lift the mute of one member in the current group.
+
+        Shields are a separate feature and are left untouched.
 
         Args:
             event: Current group message event (provides bot/group).
             user_id: QQ number or official member openid to release.
 
         Returns:
-            Dict with ``ok``, ``had_mute``, ``had_shield``, ``mute_cleared``,
-            ``shield_cleared``, and optional ``error``.
+            Dict with ``ok``, ``had_mute``, ``mute_cleared``, and optional
+            ``error``.
         """
-        return await self._plugin._clear_punishment(
+        return await self._plugin._unmute(
             event,
             str(user_id or ""),
         )
@@ -191,7 +208,9 @@ class ArcGuardAPI:
         *,
         self_id: str = "",
     ) -> dict:
-        """Clear mute and timed shield with an explicit bot/group (no event).
+        """Lift the mute with an explicit bot/group (no message event).
+
+        Shields are a separate feature and are left untouched.
 
         Args:
             bot: Platform bot client (aiocqhttp or qq_official).
@@ -200,10 +219,10 @@ class ArcGuardAPI:
             self_id: Optional bot self id (skip if equal to user_id).
 
         Returns:
-            Dict with ``ok``, ``had_mute``, ``had_shield``, ``mute_cleared``,
-            ``shield_cleared``, and optional ``error``.
+            Dict with ``ok``, ``had_mute``, ``mute_cleared``, and optional
+            ``error``.
         """
-        return await self._plugin._clear_punishment_on_bot(
+        return await self._plugin._unmute_on_bot(
             bot,
             str(group_id or ""),
             str(user_id or ""),
@@ -489,6 +508,160 @@ def count_forbidden_sequences(
     return count
 
 
+def _is_official_target(bot: Any, *ids: str) -> bool:
+    """Whether ``bot`` is a qq_official client operating on openid targets.
+
+    The non-numeric id check is the real platform discriminator: aiocqhttp
+    (OneBot) ids are always numeric QQ numbers, and its dynamic
+    ``Api.__getattr__`` makes ``hasattr(bot.api, ...)`` unreliable there.
+
+    Args:
+        bot: Platform bot client.
+        ids: Group / user ids to test (all must be non-numeric openids).
+
+    Returns:
+        True only for the official admin-API path.
+    """
+    if bot is None or not hasattr(bot, "api") or not hasattr(bot.api, "_http"):
+        return False
+    checked = [str(i or "").strip() for i in ids]
+    return bool(checked) and all(i and not i.isdigit() for i in checked)
+
+
+async def _official_set_mute(
+    bot: Any, group_openid: str, member_openid: str, *, op: str, expire_epoch: int
+) -> None:
+    """Set one member's mute state via the official group admin API.
+
+    The bot must be a group admin; the API only accepts regular members
+    (owner / other admins / bots are rejected). Expiry is an absolute
+    RFC3339 timestamp in +08:00; ``op="del"`` unmutes immediately.
+
+    Args:
+        bot: qq_official botpy client.
+        group_openid: Group openid.
+        member_openid: Target member openid.
+        op: ``add`` (fresh mute), ``update`` (change expiry), ``del`` (unmute).
+        expire_epoch: Mute expiry unix seconds (ignored for ``del``).
+
+    Raises:
+        RuntimeError: If the HTTP layer returned no response (botpy swallows
+            its own timeouts / retry exhaustion and returns None).
+        Exception: HTTP errors propagate (e.g. missing admin permission).
+    """
+    expire_at = (
+        ""
+        if op == "del"
+        else datetime.fromtimestamp(
+            max(1, int(expire_epoch)), tz=timezone(timedelta(hours=8))
+        ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    )
+    route = Route(
+        "POST",
+        "/v2/groups/{group_openid}/restrict_chat_setting",
+        group_openid=group_openid,
+    )
+    response = await asyncio.wait_for(
+        bot.api._http.request(
+            route,
+            json={
+                "members": [
+                    {
+                        "op": op,
+                        "member_openid": member_openid,
+                        "mute_expire_at": expire_at,
+                    }
+                ]
+            },
+        ),
+        timeout=_OFFICIAL_API_TIMEOUT,
+    )
+    if response is None:
+        raise RuntimeError("official mute API returned no response")
+
+
+async def _official_query_remaining(
+    bot: Any, group_openid: str, member_openid: str
+) -> int | None:
+    """Query remaining mute seconds for one member (official admin API).
+
+    Args:
+        bot: qq_official botpy client.
+        group_openid: Group openid.
+        member_openid: Member openid to look up.
+
+    Returns:
+        Remaining mute seconds (0 when not muted), or None when the lookup
+        failed (caller must fall back to the local tracker).
+    """
+    route = Route(
+        "GET",
+        "/v2/groups/{group_openid}/restrict_chat_setting",
+        group_openid=group_openid,
+    )
+    try:
+        response = await asyncio.wait_for(
+            bot.api._http.request(route), timeout=_OFFICIAL_API_TIMEOUT
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "弧光护卫：官方查询禁言状态失败 group=%s user=%s err=%s",
+            group_openid,
+            member_openid,
+            exc,
+        )
+        return None
+    if not isinstance(response, dict):
+        return None
+    members = response.get("members")
+    if not isinstance(members, list):
+        return 0
+    for item in members:
+        if not isinstance(item, dict) or item.get("member_openid") != member_openid:
+            continue
+        try:
+            expire = datetime.fromisoformat(
+                str(item.get("mute_expire_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            logger.warning(
+                "弧光护卫：官方禁言到期时间格式异常 group=%s user=%s value=%s",
+                group_openid,
+                member_openid,
+                item.get("mute_expire_at"),
+            )
+            return 0
+        return max(0, int(expire.timestamp()) - int(time.time()))
+    return 0
+
+
+async def _official_recall_message(
+    bot: Any, group_openid: str, message_id: str
+) -> None:
+    """Recall a group message via the official admin API (2-minute window).
+
+    Args:
+        bot: qq_official botpy client.
+        group_openid: Group openid.
+        message_id: Message id (``d.id`` of the incoming group event).
+
+    Raises:
+        RuntimeError: If the HTTP layer returned no response.
+        Exception: HTTP errors propagate (e.g. window exceeded / no admin).
+    """
+    route = Route(
+        "DELETE",
+        "/v2/groups/{group_openid}/messages/{message_id}",
+        group_openid=group_openid,
+        message_id=message_id,
+    )
+    response = await asyncio.wait_for(
+        bot.api._http.request(route), timeout=_OFFICIAL_API_TIMEOUT
+    )
+    if response is None:
+        raise RuntimeError("official recall API returned no response")
+
+
 @register(
     "astrbot_plugin_arc_guard",
     "DEVILENMO",
@@ -514,6 +687,8 @@ class ArcGuardPlugin(Star):
         self._card_group_ids_ts: float = 0.0
         self._card_action_ts: dict[str, float] = {}
         self._card_bot_self_ids: dict[int, str] = {}
+        # Newest (timestamp, sender_id, message_id) per group, for recall.
+        self._recent_msgs: dict[str, deque] = {}
 
     async def initialize(self) -> None:
         """Start the 1s bot group-card watch loop when protection is enabled."""
@@ -922,14 +1097,14 @@ class ArcGuardPlugin(Star):
         uid = str(user_id or "")
         return bool(uid) and uid in self._whitelist_ids()
 
-    def _blacklist_ids(self) -> set[str]:
-        """QQ ids whose group messages are always intercepted."""
+    def _permanent_shield_ids(self) -> set[str]:
+        """Ids shielded everywhere (config ``blacklist_ids``)."""
         return self._parse_id_list(self.config.get("blacklist_ids", []), ())
 
-    def _is_blacklisted(self, user_id: str) -> bool:
-        """Whether user_id is on the intercept blacklist."""
+    def _is_permanently_shielded(self, user_id: str) -> bool:
+        """Whether user_id is permanently shielded in every chat."""
         uid = str(user_id or "")
-        return bool(uid) and uid in self._blacklist_ids()
+        return bool(uid) and uid in self._permanent_shield_ids()
 
     def _card_tamper_enabled(self) -> bool:
         """Whether bot group-card protection is enabled."""
@@ -1053,6 +1228,17 @@ class ArcGuardPlugin(Star):
         except Exception:  # noqa: BLE001
             return False
         return str(user_id) in {str(a) for a in admins}
+
+    def _sender_is_super_admin(self, event: AstrMessageEvent) -> bool:
+        """Whether the message sender is a super admin (AstrBot ``admins_id``).
+
+        Args:
+            event: Message event that triggered the LLM tool.
+
+        Returns:
+            True only when the sender id is in the global admin list.
+        """
+        return self._is_astrbot_admin_id(str(event.get_sender_id() or ""))
 
     def _collect_at_ids(self, event: AstrMessageEvent) -> list[str]:
         """Collect @ targets from the message chain.
@@ -1294,7 +1480,11 @@ class ArcGuardPlugin(Star):
             Remaining mute seconds (>= 0), or ``None`` if the lookup failed
             (caller must not treat failure as "already unmuted").
         """
-        if not str(group_id).isdigit() or not str(user_id).isdigit():
+        gid = str(group_id)
+        uid = str(user_id)
+        if _is_official_target(bot, gid, uid):
+            return await _official_query_remaining(bot, gid, uid)
+        if not gid.isdigit() or not uid.isdigit():
             return None
         info = None
         try:
@@ -1451,9 +1641,69 @@ class ArcGuardPlugin(Star):
         for k in expired:
             self._mute_until.pop(k, None)
 
-    def _shield_enabled(self) -> bool:
-        """Whether mute-failure fallback to timed ignore is enabled."""
-        return bool(self.config.get("shield_fallback", True))
+    def _recall_on_hit(self) -> bool:
+        """Whether violating group messages should be recalled automatically."""
+        return bool(self.config.get("recall_on_hit", DEFAULT_RECALL_ON_HIT))
+
+    async def _recall_message_by_id(self, bot, group_id: str, message_id: str) -> bool:
+        """Recall one group message by id (best effort).
+
+        qq_official uses the admin recall API (2-minute window, normal
+        members' messages only); aiocqhttp uses OneBot ``delete_msg``.
+        Failures are logged only so callers can continue.
+
+        Args:
+            bot: Platform bot client.
+            group_id: Group id or official group openid.
+            message_id: Message id to recall.
+
+        Returns:
+            True when the recall API call succeeded.
+        """
+        gid = str(group_id or "").strip()
+        mid = str(message_id or "").strip()
+        if not gid or not mid or bot is None:
+            return False
+        try:
+            if _is_official_target(bot, gid, mid):
+                await _official_recall_message(bot, gid, mid)
+            elif gid.isdigit() and mid.isdigit() and hasattr(bot, "call_action"):
+                if hasattr(bot, "delete_msg"):
+                    await bot.delete_msg(message_id=int(mid))
+                else:
+                    await bot.call_action("delete_msg", message_id=int(mid))
+            else:
+                return False
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "弧光护卫：撤回失败（超出 2 分钟窗口或无权限时属正常） group=%s mid=%s err=%s",
+                gid,
+                mid,
+                exc,
+            )
+            return False
+
+    async def _recall_message(self, event: AstrMessageEvent) -> None:
+        """Best-effort recall of the offending group message.
+
+        Args:
+            event: Group message event whose message should be recalled.
+        """
+        if not self._recall_on_hit():
+            return
+        gid = str(event.get_group_id() or "").strip()
+        mid = str(
+            getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+        ).strip()
+        if not await self._recall_message_by_id(getattr(event, "bot", None), gid, mid):
+            return
+        logger.info(
+            "弧光护卫：已撤回违禁消息 group=%s user=%s mid=%s",
+            gid,
+            event.get_sender_id(),
+            mid,
+        )
 
     def _shield_file(self):
         """Return the persisted shield-until JSON path."""
@@ -1528,75 +1778,6 @@ class ArcGuardPlugin(Star):
             self._shield_until.pop(k, None)
         self._save_shields()
 
-    async def _fallback_to_shield(
-        self,
-        bot,
-        group_id: str,
-        user_id: str,
-        add_seconds: int,
-        result: dict,
-        *,
-        event: AstrMessageEvent | None = None,
-        announce: bool = True,
-        mute_base: int = 0,
-        error: str = "",
-    ) -> dict:
-        """Degrade a failed mute into accumulated timed ignore.
-
-        Args:
-            bot: Platform bot client (for announce fallback).
-            group_id: Group id or official group openid.
-            user_id: QQ number or official member openid.
-            add_seconds: Seconds to add on top of remaining ignore.
-            result: Mute-result dict to fill.
-            event: Optional live event for group announce.
-            announce: Whether to send the stack breakdown.
-            mute_base: Remaining mute seconds if any were already known.
-            error: Why mute was unavailable.
-
-        Returns:
-            The updated result dict (``ok`` True when shielding applied).
-        """
-        if not self._shield_enabled():
-            result["error"] = error or "禁言不可用"
-            return result
-        gid = str(group_id or "").strip()
-        uid = str(user_id or "").strip()
-        add = max(0, int(add_seconds))
-        if not gid or not uid or add <= 0:
-            result["error"] = error or "无法屏蔽"
-            return result
-        base = max(int(mute_base or 0), self._shield_remaining(gid, uid))
-        intended = min(base + add, MAX_MUTE_SECONDS)
-        self._remember_shield(gid, uid, intended)
-        result["ok"] = True
-        result["shielded"] = True
-        result["remaining_before"] = base
-        result["added"] = add
-        result["total"] = intended
-        result["error"] = error or "禁言不可用，已降级为屏蔽"
-        logger.info(
-            "弧光护卫：禁言不可用，降级屏蔽 group=%s user=%s base=%ss + add=%ss -> %ss err=%s",
-            gid,
-            uid,
-            base,
-            add,
-            intended,
-            error or "-",
-        )
-        if announce:
-            await self._announce_mute_stack(
-                bot,
-                gid,
-                uid,
-                base,
-                add,
-                intended,
-                event=event,
-                kind="shield",
-            )
-        return result
-
     @staticmethod
     def _format_mute_duration(seconds: int) -> str:
         """Format mute seconds as a short Chinese duration string."""
@@ -1617,7 +1798,6 @@ class ArcGuardPlugin(Star):
         added: int,
         total: int,
         event: AstrMessageEvent | None = None,
-        kind: str = "mute",
     ) -> None:
         """Send ``@user 之前禁言时长a，叠加禁言时长b，总禁言时长c`` in group.
 
@@ -1628,23 +1808,26 @@ class ArcGuardPlugin(Star):
             before: Remaining mute seconds before this stack.
             added: Seconds added in this stack.
             total: Intended total remaining after stack.
-            event: Optional live event; preferred on qq_official because
-                ``At(qq=openid)`` is converted to ``<@openid>``.
-            kind: ``mute`` or ``shield`` (wording only).
+            event: Optional live event; preferred on qq_official: ``At`` is
+                sent as markdown so ``<qqbot-at-user id="openid" />`` renders
+                as a real mention (plain text would show the raw tag); the
+                core falls back to plain text if markdown is rejected.
         """
         gid = str(group_id or "").strip()
         uid = str(user_id or "").strip()
         if not gid or not uid:
             return
-        label = "屏蔽" if kind == "shield" else "禁言"
         text = (
-            f" 之前{label}时长{self._format_mute_duration(before)}，"
-            f"叠加{label}时长{self._format_mute_duration(added)}，"
-            f"总{label}时长{self._format_mute_duration(total)}"
+            f" 之前禁言时长{self._format_mute_duration(before)}，"
+            f"叠加禁言时长{self._format_mute_duration(added)}，"
+            f"总禁言时长{self._format_mute_duration(total)}"
         )
         if event is not None:
+            # Markdown mode: the <qqbot-at-user> tag only renders as a real
+            # mention there; plain text would show the raw tag. The core
+            # retries with plain content if markdown is not permitted.
             result = event.chain_result([At(qq=uid), Plain(text)])
-            result.use_markdown_ = False
+            result.use_markdown_ = True
             try:
                 await event.send(result)
             except Exception as exc:  # noqa: BLE001
@@ -1694,6 +1877,9 @@ class ArcGuardPlugin(Star):
     ) -> dict:
         """Mute with accumulation using an explicit bot/group context.
 
+        Mute and shield are independent: when the mute is impossible or
+        fails, this only returns ``error`` and never creates a shield.
+
         Args:
             bot: Platform bot client (aiocqhttp or qq_official).
             group_id: Group id or official group openid.
@@ -1714,7 +1900,6 @@ class ArcGuardPlugin(Star):
             "added": 0,
             "total": 0,
             "error": "",
-            "shielded": False,
         }
         gid = str(group_id or "").strip()
         uid = str(user_id or "").strip()
@@ -1724,6 +1909,7 @@ class ArcGuardPlugin(Star):
             and uid.isdigit()
             and (hasattr(bot, "set_group_ban") or hasattr(bot, "call_action"))
         )
+        can_official = _is_official_target(bot, gid, uid)
         if not gid or not uid:
             result["error"] = "当前会话无法禁言（缺少群号或禁言接口）"
             return result
@@ -1743,17 +1929,9 @@ class ArcGuardPlugin(Star):
         if add <= 0:
             result["error"] = "追加禁言秒数必须大于 0"
             return result
-        if not can_onebot:
-            return await self._fallback_to_shield(
-                bot,
-                gid,
-                uid,
-                add,
-                result,
-                event=event,
-                announce=announce,
-                error="当前会话无法禁言（缺少群号或禁言接口）",
-            )
+        if not can_onebot and not can_official:
+            result["error"] = "当前会话无法禁言（缺少群号或禁言接口）"
+            return result
 
         # Accumulate rules:
         # - Prefer live QQ remaining when user was unmuted early / externally reduced.
@@ -1770,7 +1948,19 @@ class ArcGuardPlugin(Star):
         result["total"] = intended
 
         try:
-            if hasattr(bot, "set_group_ban"):
+            if can_official:
+                # Official admin API takes an absolute RFC3339 expiry, so the
+                # live-queried base makes the accumulate precise (no minute
+                # rounding). An already-muted member gets "update", a fresh
+                # mute gets "add".
+                await _official_set_mute(
+                    bot,
+                    gid,
+                    uid,
+                    op="update" if base > 0 else "add",
+                    expire_epoch=int(time.time()) + intended,
+                )
+            elif hasattr(bot, "set_group_ban"):
                 await bot.set_group_ban(
                     group_id=int(gid),
                     user_id=int(uid),
@@ -1784,41 +1974,42 @@ class ArcGuardPlugin(Star):
                     duration=int(duration),
                 )
             self._remember_mute_until(gid, uid, intended)
-            self._remember_shield(gid, uid, 0)
-            result["ok"] = True
-            logger.info(
-                "弧光护卫累加禁言：group=%s user=%s qq=%s tracked=%ss base=%ss "
-                "+ add=%ss -> intended=%ss set=%ss whitelist=%s",
-                gid,
-                uid,
-                "fail" if qq_remaining is None else f"{qq_remaining}s",
-                tracked_remaining,
-                base,
-                add,
-                intended,
-                duration,
-                respect_whitelist,
-            )
-            if announce:
-                await self._announce_mute_stack(
-                    bot, gid, uid, base, add, intended, event=event
-                )
-            return result
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "弧光护卫禁言失败 user=%s duration=%s err=%s", uid, duration, exc
             )
-            return await self._fallback_to_shield(
-                bot,
-                gid,
-                uid,
-                add,
-                result,
-                event=event,
-                announce=announce,
-                mute_base=base,
-                error=str(exc),
-            )
+            result["error"] = str(exc)
+            return result
+
+        # The mute already took effect: a failing announce must neither turn a
+        # successful mute into a reported failure nor break the caller's flow.
+        result["ok"] = True
+        logger.info(
+            "弧光护卫累加禁言：group=%s user=%s qq=%s tracked=%ss base=%ss "
+            "+ add=%ss -> intended=%ss set=%ss whitelist=%s",
+            gid,
+            uid,
+            "fail" if qq_remaining is None else f"{qq_remaining}s",
+            tracked_remaining,
+            base,
+            add,
+            intended,
+            duration,
+            respect_whitelist,
+        )
+        if announce:
+            try:
+                await self._announce_mute_stack(
+                    bot, gid, uid, base, add, intended, event=event
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "弧光护卫：叠加禁言播报失败 group=%s user=%s err=%s",
+                    gid,
+                    uid,
+                    exc,
+                )
+        return result
 
     async def _ban_accumulate(
         self,
@@ -1855,7 +2046,6 @@ class ArcGuardPlugin(Star):
                 "added": 0,
                 "total": 0,
                 "error": "管理员豁免，未禁言",
-                "shielded": False,
             }
         return await self._ban_accumulate_on_bot(
             getattr(event, "bot", None),
@@ -1905,6 +2095,7 @@ class ArcGuardPlugin(Star):
         *,
         send_reply: bool = True,
         from_nickname: bool = False,
+        recall: bool = True,
     ) -> str:
         """Reply with warning and mute the message source by hit count.
 
@@ -1913,6 +2104,8 @@ class ArcGuardPlugin(Star):
             hit_count: How many forbidden sequences were found.
             send_reply: Whether to send the warning text via event.send.
             from_nickname: Use nickname/card warning text instead of message text.
+            recall: Whether to recall the offending message (skipped for
+                nickname hits, where the message itself is innocent).
 
         Returns:
             The warning text used (also suitable as LLM reply replacement).
@@ -1926,6 +2119,9 @@ class ArcGuardPlugin(Star):
             else self._reply_text(minutes)
         )
         sender_id = str(event.get_sender_id() or "")
+
+        if recall and not from_nickname:
+            await self._recall_message(event)
 
         if send_reply:
             try:
@@ -1956,6 +2152,10 @@ class ArcGuardPlugin(Star):
             event: Group message event from the linked bot.
             hit_count: How many forbidden sequences were in the bot message.
         """
+        # Recall the linked bot's violating message itself (hides the insult),
+        # even when no @ target is found, then punish its @ targets.
+        await self._recall_message(event)
+
         at_ids = self._collect_at_ids(event)
         hits = max(1, int(hit_count))
         seconds = min(hits * self._accomplice_seconds_per_hit(), MAX_MUTE_SECONDS)
@@ -2112,26 +2312,38 @@ class ArcGuardPlugin(Star):
     ) -> bool:
         """Set absolute mute duration for a member (0 = unmute)."""
         try:
-            if not (
-                str(group_id).isdigit()
-                and str(user_id).isdigit()
+            gid = str(group_id)
+            uid = str(user_id)
+            if _is_official_target(bot, gid, uid):
+                # Official admin API: absolute expiry; 0 = immediate unmute.
+                op = "del" if int(duration) <= 0 else "update"
+                await _official_set_mute(
+                    bot,
+                    gid,
+                    uid,
+                    op=op,
+                    expire_epoch=int(time.time()) + max(0, int(duration)),
+                )
+            elif not (
+                gid.isdigit()
+                and uid.isdigit()
                 and (hasattr(bot, "set_group_ban") or hasattr(bot, "call_action"))
             ):
                 return False
-            if hasattr(bot, "set_group_ban"):
+            elif hasattr(bot, "set_group_ban"):
                 await bot.set_group_ban(
-                    group_id=int(group_id),
-                    user_id=int(user_id),
+                    group_id=int(gid),
+                    user_id=int(uid),
                     duration=int(duration),
                 )
             else:
                 await bot.call_action(
                     "set_group_ban",
-                    group_id=int(group_id),
-                    user_id=int(user_id),
+                    group_id=int(gid),
+                    user_id=int(uid),
                     duration=int(duration),
                 )
-            self._remember_mute_until(str(group_id), str(user_id), int(duration))
+            self._remember_mute_until(gid, uid, int(duration))
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -2143,7 +2355,7 @@ class ArcGuardPlugin(Star):
             )
             return False
 
-    async def _clear_punishment_on_bot(
+    async def _unmute_on_bot(
         self,
         bot,
         group_id: str,
@@ -2151,7 +2363,7 @@ class ArcGuardPlugin(Star):
         *,
         self_id: str = "",
     ) -> dict:
-        """Clear accumulated mute and timed shield for one group member.
+        """Lift the accumulated mute of one group member (shield untouched).
 
         Args:
             bot: Platform bot client (aiocqhttp or qq_official).
@@ -2160,15 +2372,13 @@ class ArcGuardPlugin(Star):
             self_id: Optional bot self id (skip if equal to user_id).
 
         Returns:
-            Dict with ``ok``, ``had_mute``, ``had_shield``, ``mute_cleared``,
-            ``shield_cleared``, and optional ``error``.
+            Dict with ``ok``, ``had_mute``, ``mute_cleared``, and optional
+            ``error``.
         """
         result = {
             "ok": False,
             "had_mute": False,
-            "had_shield": False,
             "mute_cleared": False,
-            "shield_cleared": False,
             "error": "",
         }
         gid = str(group_id or "").strip()
@@ -2177,7 +2387,7 @@ class ArcGuardPlugin(Star):
             result["error"] = "缺少群号或用户 ID"
             return result
         if (self_id and uid == str(self_id)) or uid in self._linked_bot_ids():
-            result["error"] = "不能解除机器人自身或联动机器人的处罚"
+            result["error"] = "不能解除机器人自身或联动机器人的禁言"
             return result
 
         mute_remaining = 0
@@ -2185,55 +2395,45 @@ class ArcGuardPlugin(Star):
             mute_remaining, _ = await self._resolve_mute_base(bot, gid, uid)
         else:
             mute_remaining = self._tracked_remaining_seconds(gid, uid)
-        shield_remaining = self._shield_remaining(gid, uid)
         result["had_mute"] = mute_remaining > 0
-        result["had_shield"] = shield_remaining > 0
-        if not result["had_mute"] and not result["had_shield"]:
-            result["error"] = "该用户当前没有禁言或屏蔽"
+        if not result["had_mute"]:
+            result["error"] = "该用户当前没有被禁言"
             return result
 
-        if result["had_mute"]:
-            if bot is not None:
-                result["mute_cleared"] = await self._set_mute_duration(bot, gid, uid, 0)
-            else:
-                self._remember_mute_until(gid, uid, 0)
-                result["mute_cleared"] = True
+        if bot is not None:
+            result["mute_cleared"] = await self._set_mute_duration(bot, gid, uid, 0)
+        else:
+            self._remember_mute_until(gid, uid, 0)
+            result["mute_cleared"] = True
 
-        if result["had_shield"]:
-            self._remember_shield(gid, uid, 0)
-            result["shield_cleared"] = True
-
-        result["ok"] = bool(result["mute_cleared"] or result["shield_cleared"])
+        result["ok"] = bool(result["mute_cleared"])
         if not result["ok"]:
             result["error"] = "解除禁言失败"
         logger.info(
-            "弧光护卫解除处罚：group=%s user=%s had_mute=%ss had_shield=%ss "
-            "mute_cleared=%s shield_cleared=%s",
+            "弧光护卫解除禁言：group=%s user=%s had_mute=%ss mute_cleared=%s",
             gid,
             uid,
             mute_remaining,
-            shield_remaining,
             result["mute_cleared"],
-            result["shield_cleared"],
         )
         return result
 
-    async def _clear_punishment(
+    async def _unmute(
         self,
         event: AstrMessageEvent,
         user_id: str,
     ) -> dict:
-        """Clear mute and timed shield for one member in the current group.
+        """Lift the mute of one member in the current group (shield untouched).
 
         Args:
             event: Current group message event.
             user_id: QQ number or official member openid to release.
 
         Returns:
-            Dict with ``ok``, ``had_mute``, ``had_shield``, ``mute_cleared``,
-            ``shield_cleared``, and optional ``error``.
+            Dict with ``ok``, ``had_mute``, ``mute_cleared``, and optional
+            ``error``.
         """
-        return await self._clear_punishment_on_bot(
+        return await self._unmute_on_bot(
             getattr(event, "bot", None),
             str(event.get_group_id() or ""),
             str(user_id or ""),
@@ -2530,16 +2730,19 @@ class ArcGuardPlugin(Star):
         minutes: int,
         reason: str = "",
     ) -> str:
-        """给群成员追加禁言（叠在当前剩余禁言时间上累加，不会覆盖更长的禁言）。
+        """给群成员追加禁言（叠在当前剩余禁言时间上累加，不会覆盖更长的禁言）。仅超级管理员可用。
 
         需要惩罚群成员时调用。最终禁言 = 当前剩余禁言 + 本次追加时间。
         例如已禁言 1 小时再追加 1 分钟，结果约为 1 小时 + 1 分钟，而不是只剩 1 分钟。
+        只有发起消息的人是超级管理员才会执行；其他人要求禁言时直接说明没有权限，不要调用。
 
         Args:
             user_id(string): 要禁言的用户 ID（QQ 号或官方 openid），不要填群昵称
             minutes(number): 本次要追加的禁言分钟数，必须大于 0
             reason(string): 可选，禁言原因说明
         """
+        if not self._sender_is_super_admin(event):
+            return SUPER_ADMIN_DENIED
         if not event.get_group_id():
             return "失败：只能在群聊中禁言"
         uid = self._parse_user_id(user_id)
@@ -2575,51 +2778,359 @@ class ArcGuardPlugin(Star):
         user_id: str,
         reason: str = "",
     ) -> str:
-        """解除群成员的禁言与屏蔽（弧光护卫施加的处罚）。
+        """解除群成员的禁言（只解除禁言，不影响屏蔽）。仅超级管理员可用。
 
-        当需要完全撤销处罚时调用，例如管理员赦免、误封纠正、或用户已认错需放行。
-        会同时清除 QQ 群禁言与插件内的限时屏蔽；若仅有其中一种，只解除已有的那一种。
+        当超级管理员要撤销禁言时调用，例如赦免、误封纠正、或用户已认错需放行。
+        只解除 QQ 群禁言；要取消屏蔽请用 arc_unshield_user。
+        只有发起消息的人是超级管理员才会执行；其他人要求解禁时直接说明没有权限，不要调用。
 
         Args:
-            user_id(string): 要解除处罚的用户 ID（QQ 号或官方 openid），不要填群昵称
+            user_id(string): 要解除禁言的用户 ID（QQ 号或官方 openid），不要填群昵称
             reason(string): 可选，解除原因说明
         """
+        if not self._sender_is_super_admin(event):
+            return SUPER_ADMIN_DENIED
         if not event.get_group_id():
-            return "失败：只能在群聊中解除禁言或屏蔽"
+            return "失败：只能在群聊中解除禁言"
         uid = self._parse_user_id(user_id)
         if not uid:
             return f"失败：无效的用户 ID（{user_id}）"
 
-        result = await self._clear_punishment(event, uid)
+        result = await self._unmute(event, uid)
         if not result.get("ok"):
             err = str(result.get("error") or "未知错误")
             return f"解除失败：{err}"
 
-        cleared: list[str] = []
-        if result.get("mute_cleared"):
-            cleared.append("禁言")
-        if result.get("shield_cleared"):
-            cleared.append("屏蔽")
-        label = "、".join(cleared) if cleared else "处罚"
         reason_text = str(reason or "").strip()
         suffix = f"；原因：{reason_text}" if reason_text else ""
-        return f"已解除 {uid} 的{label}{suffix}"
+        return f"已解除 {uid} 的禁言{suffix}"
+
+    @filter.llm_tool(name="arc_register_bot")
+    async def arc_register_bot(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        reason: str = "",
+    ) -> str:
+        """把某个账号记录为联动机器人（连坐名单）。仅超级管理员可用。
+
+        当超级管理员要求「@xx 把这个记录为机器人」时调用。记录后：该账号
+        发出的含违禁词消息不再惩罚它自己，而是连坐禁言其消息里 @ 的教唆对象；
+        同时不再检测它的群名片，也不会误禁它本身。
+        只有发起消息的人是超级管理员才会执行；其他人提出该要求时直接说明没有权限，不要调用。
+
+        Args:
+            user_id(string): 要记录的账号：@ 标记原文、openid（32 位十六进制）或 QQ 号
+            reason(string): 可选，记录原因
+        """
+        if not self._sender_is_super_admin(event):
+            return SUPER_ADMIN_DENIED
+        uid = self._parse_user_id(user_id)
+        if not uid:
+            return f"失败：无效的用户 ID（{user_id}）"
+        if self._is_whitelisted(uid):
+            return "失败：该账号在白名单，不能记录为联动机器人"
+        if self._exempt_admins() and self._is_astrbot_admin_id(uid):
+            return "失败：该账号是 AstrBot 管理员，不能记录为联动机器人"
+        bots = self._linked_bot_ids()
+        if uid in bots:
+            return f"{uid} 已经是联动机器人了，当前名单：{'、'.join(sorted(bots))}"
+        bots.add(uid)
+        self.config["linked_bot_ids"] = sorted(bots)
+        if hasattr(self.config, "save_config"):
+            self.config.save_config()
+        logger.info(
+            "弧光护卫：LLM 记录联动机器人 user=%s reason=%s total=%s",
+            uid,
+            reason,
+            len(bots),
+        )
+        return (
+            f"已把 {uid} 记录为联动机器人，今后它的违禁消息将连坐其 @ 的人。"
+            f"当前共 {len(bots)} 个：{'、'.join(sorted(bots))}"
+        )
+
+    @filter.llm_tool(name="arc_unregister_bot")
+    async def arc_unregister_bot(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        reason: str = "",
+    ) -> str:
+        """把某个账号从联动机器人（连坐名单）移除，恢复正常检测与处罚。仅超级管理员可用。
+
+        当超级管理员发现误记录、或确认该账号不再是机器人时调用。
+        只有发起消息的人是超级管理员才会执行；其他人提出该要求时直接说明没有权限，不要调用。
+
+        Args:
+            user_id(string): 要移除的账号：openid（32 位十六进制）或 QQ 号
+            reason(string): 可选，移除原因
+        """
+        if not self._sender_is_super_admin(event):
+            return SUPER_ADMIN_DENIED
+        uid = self._parse_user_id(user_id)
+        if not uid:
+            return f"失败：无效的用户 ID（{user_id}）"
+        bots = self._linked_bot_ids()
+        if uid not in bots:
+            return (
+                f"{uid} 不在联动机器人名单里。当前名单："
+                f"{'、'.join(sorted(bots)) or '（空）'}"
+            )
+        bots.discard(uid)
+        self.config["linked_bot_ids"] = sorted(bots)
+        if hasattr(self.config, "save_config"):
+            self.config.save_config()
+        logger.info(
+            "弧光护卫：LLM 移除联动机器人 user=%s reason=%s total=%s",
+            uid,
+            reason,
+            len(bots),
+        )
+        # _parse_id_list falls back to the default list when config is empty.
+        effective = bots if bots else set(DEFAULT_LINKED_BOT_IDS)
+        note = "（名单已清空，回退默认名单）" if not bots else ""
+        return (
+            f"已把 {uid} 从联动机器人名单移除。当前共 {len(effective)} 个："
+            f"{'、'.join(sorted(effective))}{note}"
+        )
+
+    @filter.llm_tool(name="arc_shield_user")
+    async def arc_shield_user(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        minutes: int = 0,
+        permanent: bool = False,
+        reason: str = "",
+    ) -> str:
+        """屏蔽某个账号：之后不再回复他的聊天，但仍审查违禁词并照常禁言。仅超级管理员可用。
+
+        屏蔽与禁言相互独立。当超级管理员要求「屏蔽他」「拉黑他」「以后别理他」时调用：
+        permanent=true 为永久屏蔽，在所有群和私聊生效，求饶无效，只能用 arc_unshield_user 取消；
+        permanent=false 为本群限时屏蔽，minutes 是本次叠加的屏蔽分钟数。
+        只有发起消息的人是超级管理员才会执行；其他人要求屏蔽时直接说明没有权限，不要调用。
+
+        Args:
+            user_id(string): 要屏蔽的账号：@ 标记原文、openid（32 位十六进制）或 QQ 号，不要填群昵称
+            minutes(number): 限时屏蔽的分钟数，permanent=false 时必填且必须大于 0
+            permanent(boolean): 是否永久屏蔽，默认 false
+            reason(string): 可选，屏蔽原因
+        """
+        if not self._sender_is_super_admin(event):
+            return SUPER_ADMIN_DENIED
+        gid = str(event.get_group_id() or "").strip()
+        uid = self._parse_user_id(user_id)
+        if not gid:
+            return "失败：只能在群聊中屏蔽"
+        if not uid:
+            return f"失败：无效的用户 ID（{user_id}）"
+        if uid == str(event.get_sender_id() or ""):
+            return "失败：不能屏蔽自己"
+        if self._is_whitelisted(uid):
+            return "失败：白名单用户不受屏蔽影响，不能屏蔽"
+        if self._is_astrbot_admin_id(uid):
+            return "失败：不能屏蔽超级管理员"
+
+        is_permanent = permanent is True or (
+            str(permanent).strip().lower() in ("true", "1", "yes")
+        )
+        try:
+            add_minutes = int(minutes)
+        except (TypeError, ValueError):
+            add_minutes = 0
+        if not is_permanent and add_minutes <= 0:
+            return "失败：需要填写 minutes（限时屏蔽分钟数），或 permanent=true（永久屏蔽）"
+
+        reason_text = str(reason or "").strip()
+        suffix = f"；原因：{reason_text}" if reason_text else ""
+        operator = str(event.get_sender_id() or "")
+        if is_permanent:
+            shields = self._permanent_shield_ids()
+            if uid in shields:
+                return f"{uid} 已经是永久屏蔽了{suffix}"
+            shields.add(uid)
+            self.config["blacklist_ids"] = sorted(shields)
+            if hasattr(self.config, "save_config"):
+                self.config.save_config()
+            logger.info(
+                "弧光护卫：LLM 永久屏蔽 user=%s operator=%s reason=%s",
+                uid,
+                operator,
+                reason_text,
+            )
+            return f"已永久屏蔽 {uid}：所有群和私聊都不再回复他的聊天，但仍审查违禁词{suffix}"
+
+        if self._is_permanently_shielded(uid):
+            return f"{uid} 已经是永久屏蔽，无需再限时屏蔽{suffix}"
+        add = min(add_minutes * 60, MAX_MUTE_SECONDS)
+        base = self._shield_remaining(gid, uid)
+        total = min(base + add, MAX_MUTE_SECONDS)
+        self._remember_shield(gid, uid, total)
+        logger.info(
+            "弧光护卫：LLM 限时屏蔽 group=%s user=%s operator=%s base=%ss "
+            "+ add=%ss -> %ss reason=%s",
+            gid,
+            uid,
+            operator,
+            base,
+            add,
+            total,
+            reason_text,
+        )
+        return (
+            f"已在本群屏蔽 {uid}：原剩余约 {max(0, (base + 59) // 60)} 分钟 + 追加 "
+            f"{add_minutes} 分钟 = 总计约 {max(1, (total + 59) // 60)} 分钟。"
+            f"期间不回复他的聊天，但仍审查违禁词{suffix}"
+        )
+
+    @filter.llm_tool(name="arc_unshield_user")
+    async def arc_unshield_user(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        reason: str = "",
+    ) -> str:
+        """取消某个账号的屏蔽（永久屏蔽和所有群的限时屏蔽一起解除），机器人恢复正常回复。仅超级管理员可用。
+
+        当超级管理员要求「取消屏蔽」「解除拉黑」时调用。只解除屏蔽，不影响禁言；
+        要解除禁言请用 arc_unmute_user。
+        只有发起消息的人是超级管理员才会执行；其他人要求取消屏蔽时直接说明没有权限，不要调用。
+
+        Args:
+            user_id(string): 要取消屏蔽的账号：@ 标记原文、openid（32 位十六进制）或 QQ 号
+            reason(string): 可选，取消原因
+        """
+        if not self._sender_is_super_admin(event):
+            return SUPER_ADMIN_DENIED
+        uid = self._parse_user_id(user_id)
+        if not uid:
+            return f"失败：无效的用户 ID（{user_id}）"
+
+        removed: list[str] = []
+        shields = self._permanent_shield_ids()
+        if uid in shields:
+            shields.discard(uid)
+            self.config["blacklist_ids"] = sorted(shields)
+            if hasattr(self.config, "save_config"):
+                self.config.save_config()
+            removed.append("永久屏蔽")
+        for gid, _shield_uid in [k for k in self._shield_until if k[1] == uid]:
+            self._remember_shield(gid, uid, 0)
+            removed.append(f"群 {gid} 的限时屏蔽")
+        reason_text = str(reason or "").strip()
+        logger.info(
+            "弧光护卫：LLM 取消屏蔽 user=%s operator=%s removed=%s reason=%s",
+            uid,
+            event.get_sender_id(),
+            removed,
+            reason_text,
+        )
+        if not removed:
+            return f"{uid} 当前没有被屏蔽"
+        suffix = f"；原因：{reason_text}" if reason_text else ""
+        return f"已取消 {uid} 的{'、'.join(removed)}，机器人恢复正常回复{suffix}"
+
+    @filter.llm_tool(name="arc_recall_user_messages")
+    async def arc_recall_user_messages(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        count: int = 1,
+        reason: str = "",
+    ) -> str:
+        """撤回某个账号在本群最近发送的几条消息。仅超级管理员可用。
+
+        当超级管理员要求「撤回他刚才发的消息」时调用。官方平台只能撤回 2 分钟内
+        发出的消息，且只能撤回普通成员的消息。
+        只有发起消息的人是超级管理员才会执行；其他人要求撤回时直接说明没有权限，不要调用。
+
+        Args:
+            user_id(string): 要撤回其消息的账号：@ 标记原文、openid（32 位十六进制）或 QQ 号
+            count(number): 最多撤回最近几条，默认 1，上限 5
+            reason(string): 可选，撤回原因
+        """
+        if not self._sender_is_super_admin(event):
+            return SUPER_ADMIN_DENIED
+        gid = str(event.get_group_id() or "").strip()
+        uid = self._parse_user_id(user_id)
+        if not gid:
+            return "失败：只能在群聊中撤回消息"
+        if not uid:
+            return f"失败：无效的用户 ID（{user_id}）"
+        try:
+            limit = max(1, int(count))
+        except (TypeError, ValueError):
+            limit = 1
+        limit = min(limit, RECALL_MAX_COUNT)
+
+        bot = getattr(event, "bot", None)
+        official = _is_official_target(bot, gid, uid)
+        now = time.time()
+        picked: list[str] = []
+        for ts, sender, mid in reversed(self._recent_msgs.get(gid) or ()):
+            if sender != uid:
+                continue
+            if official and now - ts > OFFICIAL_RECALL_WINDOW_SECONDS:
+                continue
+            picked.append(mid)
+            if len(picked) >= limit:
+                break
+        if not picked:
+            window = "（官方平台只能撤回 2 分钟内的消息）" if official else ""
+            return f"没有找到 {uid} 最近发送的可撤回消息{window}"
+
+        ok = 0
+        for mid in picked:
+            if await self._recall_message_by_id(bot, gid, mid):
+                ok += 1
+        logger.info(
+            "弧光护卫：LLM 撤回消息 group=%s user=%s operator=%s picked=%s ok=%s reason=%s",
+            gid,
+            uid,
+            event.get_sender_id(),
+            len(picked),
+            ok,
+            str(reason or "").strip(),
+        )
+        if ok <= 0:
+            return (
+                f"撤回失败：{uid} 的 {len(picked)} 条消息都没能撤回"
+                "（可能无权限，或对方不是普通成员）"
+            )
+        failed = len(picked) - ok
+        note = f"，另有 {failed} 条没能撤回" if failed > 0 else ""
+        return f"已撤回 {uid} 最近的 {ok} 条消息{note}"
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=100)
     async def on_private_pardon(self, event: AstrMessageEvent):
-        """Private-chat apology: configured phrase reduces mute/shield time.
+        """Intercept permanently shielded senders; handle private-chat apology.
 
-        Controlled by ``pardon_enabled``. When disabled, this handler does nothing.
+        Permanent shields also apply to private chat: the message is dropped
+        without any reply. For everyone else the configured phrase reduces
+        mute / timed-shield time, controlled by ``pardon_enabled``.
 
         Args:
             event: Incoming private message event.
         """
-        if not self._pardon_enabled():
-            return
         sender_id = str(event.get_sender_id() or "")
         if not sender_id or sender_id == str(event.get_self_id() or ""):
             return
         if self._is_whitelisted(sender_id):
+            return
+
+        # Private chat has no group to mute in, so forbidden hits are log-only.
+        if self._is_permanently_shielded(sender_id):
+            text = event.get_message_str() or event.message_str or ""
+            logger.info(
+                "弧光护卫：拦截永久屏蔽私聊 user=%s forbidden_hits=%s",
+                sender_id,
+                self._count_forbidden(text),
+            )
+            event.stop_event()
+            return
+
+        if not self._pardon_enabled():
             return
 
         text = event.get_message_str() or event.message_str or ""
@@ -3051,9 +3562,9 @@ class ArcGuardPlugin(Star):
     async def on_group_message(self, event: AstrMessageEvent):
         """Scan group messages and sender cards for forbidden letter sequences.
 
-        Blacklisted senders are always intercepted (``stop_event``). If their
-        message also contains forbidden sequences, mute/punish first, then
-        intercept.
+        Shielded senders (timed in this group, or permanent everywhere) never
+        get chat replies: their event is intercepted (``stop_event``), but the
+        message is still scanned and punished on forbidden hits.
 
         Args:
             event: Incoming group message event.
@@ -3062,6 +3573,16 @@ class ArcGuardPlugin(Star):
             return
 
         sender_id = str(event.get_sender_id() or "")
+        gid = str(event.get_group_id() or "")
+        mid = str(
+            getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+        ).strip()
+        # Remember recent messages so super admins can recall them by sender.
+        if gid and mid:
+            self._recent_msgs.setdefault(
+                gid, deque(maxlen=RECENT_MSGS_PER_GROUP)
+            ).append((time.time(), sender_id, mid))
+
         if sender_id == str(event.get_self_id() or ""):
             return
         if self._is_whitelisted(sender_id):
@@ -3069,14 +3590,13 @@ class ArcGuardPlugin(Star):
 
         text = event.get_message_str() or event.message_str or ""
 
-        # Group-chat pardon (for platforms without PM / mute → shield fallback).
-        # Must run before shield intercept so shielded users can still apologize.
+        # Group-chat pardon. Must run before the shield intercept so shielded
+        # users can still apologize.
         if (
             self._pardon_enabled()
             and self._pardon_in_group()
             and self._is_pardon_phrase(text)
         ):
-            gid = str(event.get_group_id() or "")
             bot = getattr(event, "bot", None)
             logger.info(
                 "弧光护卫：收到群内求饶 group=%s user=%s text=%s",
@@ -3111,21 +3631,19 @@ class ArcGuardPlugin(Star):
                 text_hits,
             )
 
-        # Blacklist / timed shield: never respond to daily chat. Still scan
-        # forbidden words — linked bots → accomplice; others → direct mute
-        # (or another shield stack if mute is still unavailable).
-        shielded = (
-            self._shield_remaining(str(event.get_group_id() or ""), sender_id) > 0
-        )
-        if self._is_blacklisted(sender_id) or shielded:
+        # Shield (timed in this group, or permanent everywhere): never respond
+        # to daily chat. Still scan forbidden words — linked bots → accomplice;
+        # others → mute. Shielding is independent of muting.
+        permanent = self._is_permanently_shielded(sender_id)
+        if permanent or self._shield_remaining(gid, sender_id) > 0:
             if text_hits > 0 and sender_id in self._linked_bot_ids():
                 await self._punish_accomplice(event, text_hits)
             elif text_hits > 0:
                 await self._punish(event, text_hits, send_reply=True)
             logger.info(
                 "弧光护卫：拦截%s消息 group=%s user=%s linked=%s forbidden_hits=%s",
-                "黑名单" if self._is_blacklisted(sender_id) else "屏蔽",
-                event.get_group_id(),
+                "永久屏蔽" if permanent else "限时屏蔽",
+                gid,
                 sender_id,
                 sender_id in self._linked_bot_ids(),
                 text_hits,
@@ -3178,7 +3696,9 @@ class ArcGuardPlugin(Star):
         seconds = min(max(1, int(hits)) * self._seconds_per_hit(), MAX_MUTE_SECONDS)
         minutes = max(1, (seconds + 59) // 60)
         if gid:
-            reply = await self._punish(event, hits, send_reply=False)
+            # No recall: the AI reply (replaced before sending) was the
+            # violation, not the user's prompt message.
+            reply = await self._punish(event, hits, send_reply=False, recall=False)
         else:
             # MC AI hub has no QQ group on the event; the hub applies jail / mute.
             reply = self._reply_text(minutes)

@@ -17,14 +17,20 @@
 - 识别常见**形似字**（希腊文、西里尔文等）
 - **出现几次就禁言几分钟**
 - **白名单**（默认 `593405016`）发言完全跳过
-- **黑名单**：配置的 QQ 群消息一律拦截（`stop_event`）
+- **屏蔽（独立功能）**：机器人不再回复其聊天，但仍检测违禁词并照常禁言，与禁言互不影响。永久屏蔽（`blacklist_ids`）在所有群和私聊生效；限时屏蔽只作用于当前群，可求饶减时
 - **累加禁言**：新禁言 = 当前剩余禁言 + 本次追加
-- **禁言失败降级屏蔽**：群禁言不可用时按相同时长屏蔽该用户；日常聊天不回复，但仍检测关键词并累加处罚；求饶同样减屏蔽时间
-- **群内求饶**：`pardon_in_group` 开启时（默认开），在群里发送求饶台词也可减刑，只减免**当前群**的禁言/屏蔽（适合不支持私聊的平台）
+- **真禁言平台**：aiocqhttp（OneBot `set_group_ban`）与 qq_official（机器人为**群管理员**时走官方 `restrict_chat_setting` 接口，上限 30 天、仅普通成员可被禁）
+- **命中自动撤回**：`recall_on_hit` 开启时（默认开），命中违禁词先撤回该消息再警告禁言；qq_official 走官方撤回接口（发出超 2 分钟不可撤），aiocqhttp 走 `delete_msg`；联动机器人的违禁消息同样撤回；撤回失败不影响警告与禁言
+- **群内求饶**：`pardon_in_group` 开启时（默认开），在群里发送求饶台词也可减刑，只减免**当前群**的禁言/限时屏蔽（适合不支持私聊的平台）
 - **私聊求饶**：仍可用；成功后会向涉及群广播
 - **跨插件禁言 API**：`mute_user` / `mute_user_in_group`（`respect_whitelist`）/ `unmute_user` / `unmute_user_in_group`
-- **LLM 工具** `arc_mute_user`：大模型可对指定 QQ 追加禁言（同样累加）
-- **LLM 工具** `arc_unmute_user`：大模型可解除指定 QQ 在本群的禁言与限时屏蔽
+- **LLM 工具**（全部**仅超级管理员可用**，即 AstrBot 管理员 `admins_id`；发起人不是超级管理员时强制拒绝）：
+  - `arc_mute_user`：对指定用户追加禁言（同样累加）
+  - `arc_unmute_user`：解除指定用户在本群的禁言（不影响屏蔽）
+  - `arc_shield_user`：屏蔽指定用户，`minutes` 为本群限时屏蔽，`permanent=true` 为永久屏蔽
+  - `arc_unshield_user`：取消永久屏蔽和所有群的限时屏蔽（不影响禁言）
+  - `arc_recall_user_messages`：撤回指定用户在本群最近的几条消息（上限 5，官方平台限 2 分钟内）
+  - `arc_register_bot` / `arc_unregister_bot`：维护联动机器人名单
 - **机器人群名片守护**：`card_tamper_protect` 开启时每秒检测，被改则改回 `bot_group_card`（默认天星大人）并制裁
 - **图片 OCR**：本地 `rapidocr` + `onnxruntime`（small 模型），`ocr_enabled` 可开关；带透明通道的图会白底+黑底各识别一次（防幻影坦克）
 
@@ -36,11 +42,13 @@
 2. 解析其消息里 `@` 了谁
 3. 对被 `@` 的教唆犯连坐禁言
 
+连坐名单支持 **LLM 动态维护**：@ 机器人说「@xx 把这个记录为机器人」即写入名单（`arc_register_bot`），「移除」用 `arc_unregister_bot`；持久化到 `linked_bot_ids` 配置，官方 openid 与 QQ 号均可（解决官方平台消息里机器人 openid 对不上 QQ 号的问题）。白名单与 AstrBot 管理员不可被记录。
+
 ## 要求
 
-- 平台：`aiocqhttp`（OneBot）
+- 平台：`aiocqhttp`（OneBot）或 `qq_official`
 - AstrBot `>= 4.0.0`
-- 机器人需要有**群禁言权限**
+- 真禁言/撤回需要机器人为**群管理员**（OneBot 群禁言权限；qq_official 为群管理员身份，且开放平台已开通群管理与撤回权限）
 - OCR：插件 `requirements.txt` 会安装 `rapidocr`、`onnxruntime`
 
 ## 配置要点
@@ -54,8 +62,8 @@
 | `pardon_in_group` | `true` | 是否允许在群内发送求饶台词减刑 |
 | `pardon_phrase` | `天星大人我错了，我跪下求你放过我` | 求饶台词 |
 | `whitelist_ids` | `593405016` | 白名单 QQ |
-| `blacklist_ids` | （空） | 黑名单 QQ |
-| `shield_fallback` | `true` | 禁言失败时降级为限时屏蔽 |
+| `blacklist_ids` | （空） | 永久屏蔽名单（所有群和私聊都不回复其聊天，仍检测违禁词） |
+| `recall_on_hit` | `true` | 命中违禁词自动撤回消息（需群管理员） |
 
 ## 安装
 
