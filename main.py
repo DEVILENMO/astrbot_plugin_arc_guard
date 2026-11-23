@@ -16,8 +16,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.provider import LLMResponse
 from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.command_group import CommandGroupFilter
+from astrbot.core.star.filter.regex import RegexFilter
 
-PLUGIN_VERSION = "1.12.1"
+PLUGIN_VERSION = "1.12.2"
 PLUGIN_NAME = "astrbot_plugin_arc_guard"
 GUARD_DISPLAY = "弧光护卫"
 
@@ -1107,29 +1110,29 @@ class ArcGuardPlugin(Star):
         return bool(uid) and uid in self._permanent_shield_ids()
 
     def _is_command_message(self, event: AstrMessageEvent) -> bool:
-        """Whether the message looks like a wake-prefix command (e.g. ``/要牌``).
+        """Whether a command handler (e.g. ``/要牌``, ``/help``) was activated.
 
         Shielding only blocks chat replies; command interactions must still
-        work for shielded users. Mirrors the core's own wake-prefix check
-        (``wake_prefix`` is a list, default ``["/"]``).
+        work for shielded users. The wake prefix cannot be detected here:
+        the pipeline strips it from ``message_str`` before handlers run
+        (``waking_check`` stage). The waking stage stores every handler whose
+        filters passed in the ``activated_handlers`` extra — that includes
+        plain message listeners, so this only counts handlers carrying a
+        command-type filter, mirroring the core's own command/listener split.
 
         Args:
             event: Incoming message event.
 
         Returns:
-            True when the message text starts with a configured wake prefix.
+            True when at least one activated handler is a command.
         """
-        text = str(event.message_str or event.get_message_str() or "").strip()
-        if not text:
-            return False
-        try:
-            prefixes = self.context.get_config().get("wake_prefix", ["/"])
-        except Exception:  # noqa: BLE001
-            prefixes = ["/"]
-        if isinstance(prefixes, str):
-            prefixes = [prefixes]
-        cleaned = [str(p) for p in prefixes if str(p)]
-        return any(text.startswith(p) for p in cleaned) if cleaned else False
+        for handler in event.get_extra("activated_handlers") or []:
+            for event_filter in getattr(handler, "event_filters", None) or ():
+                if isinstance(
+                    event_filter, (CommandFilter, CommandGroupFilter, RegexFilter)
+                ):
+                    return True
+        return False
 
     def _card_tamper_enabled(self) -> bool:
         """Whether bot group-card protection is enabled."""
@@ -3145,7 +3148,7 @@ class ArcGuardPlugin(Star):
             return
 
         # Private chat has no group to mute in, so forbidden hits are log-only.
-        # Wake-prefix commands still pass through for shielded users.
+        # Command messages still pass through for shielded users.
         if self._is_permanently_shielded(sender_id):
             text = event.get_message_str() or event.message_str or ""
             if self._is_command_message(event):
@@ -3593,8 +3596,9 @@ class ArcGuardPlugin(Star):
 
         Shielded senders (timed in this group, or permanent everywhere) never
         get chat replies: their event is intercepted (``stop_event``), but the
-        message is still scanned and punished on forbidden hits. Wake-prefix
-        commands are not intercepted so shielded users can keep interacting.
+        message is still scanned and punished on forbidden hits. Command
+        messages (an activated command handler exists) are not intercepted so
+        shielded users can keep interacting.
 
         Args:
             event: Incoming group message event.
