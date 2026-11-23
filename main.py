@@ -17,7 +17,7 @@ from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.provider import LLMResponse
 from astrbot.api.star import Context, Star, StarTools, register
 
-PLUGIN_VERSION = "1.12.0"
+PLUGIN_VERSION = "1.12.1"
 PLUGIN_NAME = "astrbot_plugin_arc_guard"
 GUARD_DISPLAY = "弧光护卫"
 
@@ -1105,6 +1105,31 @@ class ArcGuardPlugin(Star):
         """Whether user_id is permanently shielded in every chat."""
         uid = str(user_id or "")
         return bool(uid) and uid in self._permanent_shield_ids()
+
+    def _is_command_message(self, event: AstrMessageEvent) -> bool:
+        """Whether the message looks like a wake-prefix command (e.g. ``/要牌``).
+
+        Shielding only blocks chat replies; command interactions must still
+        work for shielded users. Mirrors the core's own wake-prefix check
+        (``wake_prefix`` is a list, default ``["/"]``).
+
+        Args:
+            event: Incoming message event.
+
+        Returns:
+            True when the message text starts with a configured wake prefix.
+        """
+        text = str(event.message_str or event.get_message_str() or "").strip()
+        if not text:
+            return False
+        try:
+            prefixes = self.context.get_config().get("wake_prefix", ["/"])
+        except Exception:  # noqa: BLE001
+            prefixes = ["/"]
+        if isinstance(prefixes, str):
+            prefixes = [prefixes]
+        cleaned = [str(p) for p in prefixes if str(p)]
+        return any(text.startswith(p) for p in cleaned) if cleaned else False
 
     def _card_tamper_enabled(self) -> bool:
         """Whether bot group-card protection is enabled."""
@@ -3120,8 +3145,12 @@ class ArcGuardPlugin(Star):
             return
 
         # Private chat has no group to mute in, so forbidden hits are log-only.
+        # Wake-prefix commands still pass through for shielded users.
         if self._is_permanently_shielded(sender_id):
             text = event.get_message_str() or event.message_str or ""
+            if self._is_command_message(event):
+                logger.info("弧光护卫：放行永久屏蔽私聊命令 user=%s", sender_id)
+                return
             logger.info(
                 "弧光护卫：拦截永久屏蔽私聊 user=%s forbidden_hits=%s",
                 sender_id,
@@ -3564,7 +3593,8 @@ class ArcGuardPlugin(Star):
 
         Shielded senders (timed in this group, or permanent everywhere) never
         get chat replies: their event is intercepted (``stop_event``), but the
-        message is still scanned and punished on forbidden hits.
+        message is still scanned and punished on forbidden hits. Wake-prefix
+        commands are not intercepted so shielded users can keep interacting.
 
         Args:
             event: Incoming group message event.
@@ -3632,17 +3662,28 @@ class ArcGuardPlugin(Star):
             )
 
         # Shield (timed in this group, or permanent everywhere): never respond
-        # to daily chat. Still scan forbidden words — linked bots → accomplice;
-        # others → mute. Shielding is independent of muting.
+        # to daily chat, but wake-prefix commands still pass so shielded users
+        # can keep interacting (games, help, ...). Forbidden words are still
+        # audited — linked bots → accomplice; others → mute.
         permanent = self._is_permanently_shielded(sender_id)
         if permanent or self._shield_remaining(gid, sender_id) > 0:
+            kind = "永久屏蔽" if permanent else "限时屏蔽"
             if text_hits > 0 and sender_id in self._linked_bot_ids():
                 await self._punish_accomplice(event, text_hits)
             elif text_hits > 0:
                 await self._punish(event, text_hits, send_reply=True)
+            if self._is_command_message(event):
+                logger.info(
+                    "弧光护卫：放行%s命令 group=%s user=%s forbidden_hits=%s",
+                    kind,
+                    gid,
+                    sender_id,
+                    text_hits,
+                )
+                return
             logger.info(
                 "弧光护卫：拦截%s消息 group=%s user=%s linked=%s forbidden_hits=%s",
-                "永久屏蔽" if permanent else "限时屏蔽",
+                kind,
                 gid,
                 sender_id,
                 sender_id in self._linked_bot_ids(),

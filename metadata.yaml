@@ -35,7 +35,7 @@ help: |
   连坐：联动机器人（配置 linked_bot_ids）若发出违禁内容，
   则禁言其消息里 @ 的人（次数 × 2 分钟，例如 10 次 → 20 分钟）。
   连坐名单可动态维护：超级管理员 @ 机器人说「@xx 把这个记录为机器人」即可写入名单。
-version: 1.12.0
+version: 1.12.1
 author: DEVILENMO
 repo: https://github.com/DEVILENMO/astrbot_plugin_arc_guard
 support_platforms:
