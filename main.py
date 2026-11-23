@@ -20,7 +20,7 @@ from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.filter.regex import RegexFilter
 
-PLUGIN_VERSION = "1.12.2"
+PLUGIN_VERSION = "1.12.3"
 PLUGIN_NAME = "astrbot_plugin_arc_guard"
 GUARD_DISPLAY = "弧光护卫"
 
@@ -1246,9 +1246,6 @@ class ArcGuardPlugin(Star):
         ).strip()
         return text or DEFAULT_ACCOMPLICE_REPLY
 
-    def _exempt_admins(self) -> bool:
-        return bool(self.config.get("exempt_admins", True))
-
     def _is_astrbot_admin_id(self, user_id: str) -> bool:
         """Whether user_id is listed in AstrBot admins_id."""
         try:
@@ -1948,9 +1945,12 @@ class ArcGuardPlugin(Star):
             result["error"] = "白名单用户不可禁言"
             logger.info("弧光护卫：跳过白名单禁言 user=%s", uid)
             return result
-        if self._exempt_admins() and self._is_astrbot_admin_id(uid):
-            result["error"] = "管理员豁免，未禁言"
-            logger.info("弧光护卫：跳过管理员禁言 user=%s", uid)
+        if self._is_astrbot_admin_id(uid):
+            # Hard backdoor: super admins can never be muted through Arc
+            # Guard, regardless of config or caller arguments (games pass
+            # respect_whitelist=False; that must not lift this).
+            result["error"] = "超级管理员受保护，无法被禁言"
+            logger.info("弧光护卫：跳过超级管理员禁言 user=%s", uid)
             return result
 
         add = max(0, int(add_seconds))
@@ -2062,19 +2062,7 @@ class ArcGuardPlugin(Star):
             and optional ``error``.
         """
         uid = str(user_id or "").strip()
-        if (
-            self._exempt_admins()
-            and uid == str(event.get_sender_id() or "")
-            and (event.is_admin() or self._is_astrbot_admin_id(uid))
-        ):
-            logger.info("弧光护卫：跳过管理员禁言 user=%s", uid)
-            return {
-                "ok": False,
-                "remaining_before": 0,
-                "added": 0,
-                "total": 0,
-                "error": "管理员豁免，未禁言",
-            }
+        # Super-admin targets are refused inside _ban_accumulate_on_bot.
         return await self._ban_accumulate_on_bot(
             getattr(event, "bot", None),
             str(event.get_group_id() or ""),
@@ -2858,7 +2846,7 @@ class ArcGuardPlugin(Star):
             return f"失败：无效的用户 ID（{user_id}）"
         if self._is_whitelisted(uid):
             return "失败：该账号在白名单，不能记录为联动机器人"
-        if self._exempt_admins() and self._is_astrbot_admin_id(uid):
+        if self._is_astrbot_admin_id(uid):
             return "失败：该账号是 AstrBot 管理员，不能记录为联动机器人"
         bots = self._linked_bot_ids()
         if uid in bots:

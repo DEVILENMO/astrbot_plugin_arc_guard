@@ -47,12 +47,6 @@
     "hint": "惩罚教唆犯时发送的文本",
     "default": "人家本来就傻，你还他妈逗人家，连坐惩罚！"
   },
-  "exempt_admins": {
-    "description": "豁免 AstrBot 管理员",
-    "type": "bool",
-    "hint": "为 true 时不对 AstrBot 配置中的管理员执行禁言（仍会检测并回复）",
-    "default": true
-  },
   "whitelist_ids": {
     "description": "禁言白名单 ID",
     "type": "list",

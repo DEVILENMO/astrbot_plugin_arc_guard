@@ -23,6 +23,7 @@
 - **命中自动撤回**：`recall_on_hit` 开启时（默认开），命中违禁词先撤回该消息再警告禁言；qq_official 走官方撤回接口（发出超 2 分钟不可撤），aiocqhttp 走 `delete_msg`；联动机器人的违禁消息同样撤回；撤回失败不影响警告与禁言
 - **群内求饶**：`pardon_in_group` 开启时（默认开），在群里发送求饶台词也可减刑，只减免**当前群**的禁言/限时屏蔽（适合不支持私聊的平台）
 - **私聊求饶**：仍可用；成功后会向涉及的群广播（`qq_official` 上只私聊回复，不进群广播）
+- **超级管理员硬保护**：AstrBot 管理员（`admins_id`）无法通过弧光护卫禁言系统的**任何途径**被禁言——违禁词自动处罚、游戏插件调用（即使 `respect_whitelist=false`）、LLM 工具一律拒绝；检测与警告照常，仅不执行禁言。此项不可配置
 - **跨插件禁言 API**：`mute_user` / `mute_user_in_group`（`respect_whitelist`）/ `unmute_user` / `unmute_user_in_group`。两个平台通用；其他插件的禁言建议优先调用这些接口，以保留叠加时长（[21点](https://github.com/DEVILENMO/astrbot_plugin_blackjack21)、[自爆卡车](https://github.com/DEVILENMO/astrbot_plugin_self_destruct_truck) 即如此）
 - **LLM 工具**（全部**仅超级管理员可用**，即 AstrBot 管理员 `admins_id`；发起人不是超级管理员时强制拒绝）：
   - `arc_mute_user`：对指定用户追加禁言（同样累加）
@@ -63,13 +64,17 @@
 | `pardon_in_group` | `true` | 是否允许在群内发送求饶台词减刑 |
 | `pardon_phrase` | `天星大人我错了，我跪下求你放过我` | 求饶台词 |
 | `whitelist_ids` | `593405016` | 白名单 ID（QQ 号或官方 openid），发言完全不处理 |
-| `blacklist_ids` | （空） | 永久屏蔽名单（所有群和私聊都不回复其聊天，仍检测违禁词） |
+| `blacklist_ids` | （空） | 永久屏蔽名单（所有群和私聊都不回复其聊天，仍检测违禁词；命令交互不受影响） |
 | `linked_bot_ids` | `2267236706` | 联动机器人（连坐）名单，可填 QQ 号或官方 openid |
 | `accomplice_mute_seconds` | `120` | 连坐时每次命中的禁言秒数 |
-| `exempt_admins` | `true` | 是否豁免 AstrBot 管理员（不对其禁言） |
 | `recall_on_hit` | `true` | 命中违禁词自动撤回消息（需群管理员） |
 
 ## 更新记录
+
+### 1.12.3
+
+- 超级管理员（AstrBot `admins_id`）受硬保护：任何走弧光护卫禁言系统的调用都无法禁言他们，`respect_whitelist=false` 也不例外；原来的 `exempt_admins` 开关移除（保护不再可关闭）
+- 联动机器人名单同样不再接受 AstrBot 管理员（不再受 `exempt_admins` 开关影响）
 
 ### 1.12.2
 
